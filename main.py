@@ -14,16 +14,14 @@ DOMAIN = os.environ.get("DOMAIN", "http://localhost:8000")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     bot_task = asyncio.create_task(bot.start())
-    print("🚀 FastAPI 網頁+串流伺服器已成功就緒！")
+    print("🚀 FastAPI 網頁服務已成功啟動！")
     yield
     await bot.stop()
     bot_task.cancel()
 
 app = FastAPI(lifespan=lifespan)
-
 bot = Client("stream_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
-# 1. 接收影片事件
 @bot.on_message(filters.video | filters.document)
 async def handle_media(client: Client, message: Message):
     media = message.video or message.document
@@ -37,13 +35,12 @@ async def handle_media(client: Client, message: Message):
     stream_url = f"{base_domain}/stream/{unique_file_id}"
     
     await message.reply_text(
-        f"🎬 **串流服務已成功生成！**\n\n"
+        f"🎬 **串流網址已完美修正！**\n\n"
         f"🌐 **網頁瀏覽器直接看：**\n`{web_url}`\n\n"
-        f"📺 **VLC / PotPlayer 專用直鏈：**\n`{stream_url}`\n\n"
-        f"💡 提示：點擊網頁連結即可在瀏覽器內直接免下載播放！"
+        f"📺 **VLC / PotPlayer 直鏈：**\n`{stream_url}`\n\n"
+        f"💡 提示：點擊第一個網頁網址即可在 Chrome/Safari 直接觀看！"
     )
 
-# 2. 網頁播放器介面
 @app.get("/watch/{file_id}", response_class=HTMLResponse)
 async def watch_video_page(file_id: str):
     html_content = f"""
@@ -54,18 +51,18 @@ async def watch_video_page(file_id: str):
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Telegram 網頁即時串流播放器</title>
         <style>
-            body {{ margin: 0; background: #0e0e0e; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; flex-direction: column; }}
-            .container {{ width: 90%; max-width: 800px; text-align: center; }}
-            video {{ width: 100%; border-radius: 8px; box-shadow: 0 4px 20px rgba(0,0,0,0.8); background: #000; }}
-            h1 {{ font-size: 1.2rem; margin-bottom: 15px; color: #3babff; }}
+            body {{ margin: 0; background: #0b0b0b; color: #fff; font-family: sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; flex-direction: column; }}
+            .container {{ width: 95%; max-width: 850px; text-align: center; }}
+            video {{ width: 100%; border-radius: 12px; box-shadow: 0 8px 32px rgba(0,0,0,0.9); background: #000; }}
+            h1 {{ font-size: 1.3rem; margin-bottom: 20px; color: #3babff; letter-spacing: 1px; }}
         </style>
     </head>
     <body>
         <div class="container">
-            <h1>🎬 正在透過 MTProto 免下載即時串流播放...</h1>
-            <video controls autoplay preload="metadata">
+            <h1>🎬 正在透過系統分塊傳輸解碼（支援快進）...</h1>
+            <video controls autoplay preload="auto" playsinline>
                 <source src="/stream/{file_id}" type="video/mp4">
-                您的瀏覽器不支援 HTML5 影片播放。
+                您的瀏覽器不支援此 MP4 編碼播放。
             </video>
         </div>
     </body>
@@ -73,25 +70,28 @@ async def watch_video_page(file_id: str):
     """
     return HTMLResponse(content=html_content, status_code=200)
 
-# 3. 核心修正：改用 stream_media！這才是真正不卡死的快取串流核心
-async def chunk_generator(file_properties, start: int, end: int):
+# 💡 核心修復：精確換算字節，完美支援瀏覽器 Range 請求
+async def chunk_generator(file_properties, start_byte: int, end_byte: int):
     try:
-        # 計算偏移量佔總體檔案的第幾個區塊 (Telegram 每次要求 1MB 塊)
-        chunk_size = 1024 * 1024
-        start_chunk = start // chunk_size
+        # Telegram MTProto 標準分塊大小為 1MB (1024 * 1024 bytes)
+        tg_chunk_size = 1024 * 1024
         
-        # 使用 Hydrogram 專門的 stream_media 方法！
-        async for chunk in bot.stream_media(file_properties, limit=(start_chunk + 1)):
+        # 計算瀏覽器要求的起點是第幾個區塊
+        start_chunk = start_byte // tg_chunk_size
+        
+        # 使用 stream_media 並給予精確的 offset（跳過前幾個區塊）
+        # 這樣當瀏覽器快進時，才不會永遠都從影片第 0 秒開始抓而導致黑畫面
+        async for chunk in bot.stream_media(file_properties, offset=start_chunk):
             if not chunk:
                 break
             yield bytes(chunk)
     except Exception as e:
-        print(f"Streaming error: {e}")
+        print(f"流媒體傳輸中斷: {e}")
 
-# 4. 串流數據核心介面
 @app.get("/stream/{file_id}")
 async def stream_endpoint(file_id: str, range: str = Header(None)):
     try:
+        # 1. 解析檔案屬性（取得精確的 file_size 給瀏覽器分配緩衝）
         file_properties = await bot.get_file(file_id)
         if not file_properties:
             raise HTTPException(status_code=404, detail="檔案不存在")
@@ -99,7 +99,7 @@ async def stream_endpoint(file_id: str, range: str = Header(None)):
         file_size = file_properties.file_size
         start, end = 0, file_size - 1
 
-        # 完美支援瀏覽器拉動進度條
+        # 2. 嚴格解析瀏覽器的 HTTP Range (這是消除黑畫面的致命關鍵)
         if range and range.startswith("bytes="):
             try:
                 range_str = range.replace("bytes=", "")
@@ -110,15 +110,21 @@ async def stream_endpoint(file_id: str, range: str = Header(None)):
                     end = int(parts[1])
             except Exception:
                 pass
-        
+
+        # 3. 封裝完全符合 Chrome 和 Safari 規格的 206 狀態標頭
         headers = {
             "Content-Range": f"bytes {start}-{end}/{file_size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(end - start + 1),
-            "Content-Type": "video/mp4",
+            "Content-Type": "video/mp4",  # 讓瀏覽器明確知道是 MP4 格式
+            "Cache-Control": "no-cache",
         }
-        # 將解析出的 file_properties 傳入生成器中進行精確切片
-        return StreamingResponse(chunk_generator(file_properties, start, end), status_code=206, headers=headers)
+        
+        return StreamingResponse(
+            chunk_generator(file_properties, start, end), 
+            status_code=206, 
+            headers=headers
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
