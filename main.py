@@ -23,7 +23,7 @@ app = FastAPI(lifespan=lifespan)
 
 bot = Client("stream_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, in_memory=True)
 
-# 1. 接收影片事件：同時給予使用者「網頁觀看」與「播放器直鏈」兩種網址
+# 1. 接收影片事件
 @bot.on_message(filters.video | filters.document)
 async def handle_media(client: Client, message: Message):
     media = message.video or message.document
@@ -33,9 +33,7 @@ async def handle_media(client: Client, message: Message):
     unique_file_id = media.file_id
     base_domain = DOMAIN.rstrip('/')
     
-    # 網頁播放網址
     web_url = f"{base_domain}/watch/{unique_file_id}"
-    # 播放器直鏈網址
     stream_url = f"{base_domain}/stream/{unique_file_id}"
     
     await message.reply_text(
@@ -45,10 +43,9 @@ async def handle_media(client: Client, message: Message):
         f"💡 提示：點擊網頁連結即可在瀏覽器內直接免下載播放！"
     )
 
-# 2. 【核心新增】網頁播放器介面：當使用者用瀏覽器打開時，渲染出一個精美的播放器
+# 2. 網頁播放器介面
 @app.get("/watch/{file_id}", response_class=HTMLResponse)
 async def watch_video_page(file_id: str):
-    # 建立一個極簡的 HTML5 原生播放器網頁
     html_content = f"""
     <!DOCTYPE html>
     <html lang="zh-TW">
@@ -66,7 +63,6 @@ async def watch_video_page(file_id: str):
     <body>
         <div class="container">
             <h1>🎬 正在透過 MTProto 免下載即時串流播放...</h1>
-            <!-- src 直接對接我們下方寫好的串流核心，瀏覽器會自動用 HTTP Range 分塊索取影片 -->
             <video controls autoplay preload="metadata">
                 <source src="/stream/{file_id}" type="video/mp4">
                 您的瀏覽器不支援 HTML5 影片播放。
@@ -77,18 +73,22 @@ async def watch_video_page(file_id: str):
     """
     return HTMLResponse(content=html_content, status_code=200)
 
-# 3. 串流分塊生成器邏輯
-async def chunk_generator(file_id: str, start: int, end: int, chunk_size: int):
-    offset = start
-    while offset <= end:
-        current_size = min(chunk_size, end - offset + 1)
-        chunk = await bot.download_media(file_id, in_memory=True, offset=offset, limit=current_size)
-        if not chunk:
-            break
-        yield bytes(chunk)
-        offset += len(chunk)
+# 3. 核心修正：改用 stream_media！這才是真正不卡死的快取串流核心
+async def chunk_generator(file_properties, start: int, end: int):
+    try:
+        # 計算偏移量佔總體檔案的第幾個區塊 (Telegram 每次要求 1MB 塊)
+        chunk_size = 1024 * 1024
+        start_chunk = start // chunk_size
+        
+        # 使用 Hydrogram 專門的 stream_media 方法！
+        async for chunk in bot.stream_media(file_properties, limit=(start_chunk + 1)):
+            if not chunk:
+                break
+            yield bytes(chunk)
+    except Exception as e:
+        print(f"Streaming error: {e}")
 
-# 4. 串流數據核心介面（支援 Chrome / Safari / Firefox 的分塊 Range 快進要求）
+# 4. 串流數據核心介面
 @app.get("/stream/{file_id}")
 async def stream_endpoint(file_id: str, range: str = Header(None)):
     try:
@@ -99,7 +99,7 @@ async def stream_endpoint(file_id: str, range: str = Header(None)):
         file_size = file_properties.file_size
         start, end = 0, file_size - 1
 
-        # 完美支援瀏覽器拉動進度條 (Seek)
+        # 完美支援瀏覽器拉動進度條
         if range and range.startswith("bytes="):
             try:
                 range_str = range.replace("bytes=", "")
@@ -110,8 +110,6 @@ async def stream_endpoint(file_id: str, range: str = Header(None)):
                     end = int(parts[1])
             except Exception:
                 pass
-
-        CHUNK_SIZE = 1024 * 1024  # 每次讀取 1MB
         
         headers = {
             "Content-Range": f"bytes {start}-{end}/{file_size}",
@@ -119,7 +117,8 @@ async def stream_endpoint(file_id: str, range: str = Header(None)):
             "Content-Length": str(end - start + 1),
             "Content-Type": "video/mp4",
         }
-        return StreamingResponse(chunk_generator(file_id, start, end, CHUNK_SIZE), status_code=206, headers=headers)
+        # 將解析出的 file_properties 傳入生成器中進行精確切片
+        return StreamingResponse(chunk_generator(file_properties, start, end), status_code=206, headers=headers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
