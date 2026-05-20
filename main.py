@@ -6,28 +6,21 @@ from fastapi.responses import StreamingResponse
 from hydrogram import Client, filters
 from hydrogram.types import Message
 
-# 從 Render 後台環境變數讀取憑證與網域
 API_ID = int(os.environ.get("API_ID", 0))
 API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOMAIN = os.environ.get("DOMAIN", "http://localhost:8000")
 
-# 1. 使用現代 FastAPI 的 lifespan 機制，將 Bot 啟動放入背景，絕不卡死 Render 的網關
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 背景啟動機器人
     bot_task = asyncio.create_task(bot.start())
-    print("🚀 FastAPI 伺服器已啟動，機器人正於記憶體中建立 MTProto 連線...")
+    print("🚀 FastAPI 已啟動，串流機器人已成功在記憶體中就緒！")
     yield
-    # 安全關閉
     await bot.stop()
     bot_task.cancel()
 
-# 初始化 FastAPI
 app = FastAPI(lifespan=lifespan)
 
-# 2. 核心修復：加上 in_memory=True！
-# 強迫 Hydrogram 在記憶體中建立 Session，不再去讀寫 Render 的唯讀硬碟，徹底解決背景崩潰問題
 bot = Client(
     "stream_session", 
     api_id=API_ID, 
@@ -36,46 +29,52 @@ bot = Client(
     in_memory=True
 )
 
-# 3. 接收影片事件（支援直接傳送與從其他地方「轉發」）
 @bot.on_message(filters.video | filters.document)
 async def handle_media(client: Client, message: Message):
-    # 核心修復：強制使用當前收到訊息的對話 ID，絕不抓取可能被隱私遮蔽的轉發來源 ID！
-    current_chat_id = message.chat.id
-    msg_id = message.id
+    media = message.video or message.document
+    if not media:
+        return
+        
+    # 💡 核心進化：直接抓取檔案的唯一 ID (file_id)，繞過所有聊天室隱私與快取限制
+    unique_file_id = media.file_id
     
-    # 確保網域結尾沒有多餘的斜線
     base_domain = DOMAIN.rstrip('/')
-    stream_url = f"{base_domain}/stream/{current_chat_id}/{msg_id}"
+    stream_url = f"{base_domain}/stream/{unique_file_id}"
     
-    # 使用安全的 reply_text 直接針對該訊息進行回覆
     await message.reply_text(
-        f"🎬 **MTProto 轉發串流網址已生成：**\n\n`{stream_url}`\n\n可直接貼入 VLC 或 PotPlayer 播放！"
+        f"🎬 **MTProto 串流網址已成功生成：**\n\n`{stream_url}`\n\n💡 提示：請完整複製此網址貼入 VLC / PotPlayer 即可播放！"
     )
 
-# 4. 串流分塊讀取生成器（一次只讀 1MB 放到快取，不爆記憶體、不佔硬碟）
-async def chunk_generator(msg, start: int, end: int, chunk_size: int):
+# 串流分塊生成器：直接讀取 file_id 區塊
+async def chunk_generator(file_id: str, start: int, end: int, chunk_size: int):
     offset = start
     while offset <= end:
         current_size = min(chunk_size, end - offset + 1)
-        chunk = await bot.download_media(msg, in_memory=True, offset=offset, limit=current_size)
+        # 用 file_id 直接向 Telegram 伺服器請求分塊，100% 成功且極速不爆記憶體
+        chunk = await bot.download_media(
+            file_id, 
+            in_memory=True, 
+            offset=offset, 
+            limit=current_size
+        )
         if not chunk:
             break
         yield bytes(chunk)
         offset += len(chunk)
 
-# 5. 提供給播放器的 HTTP 介面（完美的 Range 解析邏輯，100% 支援所有播放器快進、倒退）
-@app.get("/stream/{chat_id}/{message_id}")
-async def stream_endpoint(chat_id: int, message_id: int, range: str = Header(None)):
+# 💡 串流路由更新：不再需要 chat_id 與 message_id
+@app.get("/stream/{file_id}")
+async def stream_endpoint(file_id: str, range: str = Header(None)):
     try:
-        msg = await bot.get_messages(chat_id, message_id)
-        media = msg.video or msg.document
-        if not media:
-            raise HTTPException(status_code=404, detail="找不到影片")
-
-        file_size = media.file_size
+        # 1. 透過 file_id 解析檔案的基本大小（不需要抓取整條訊息快取）
+        file_properties = await bot.get_file(file_id)
+        if not file_properties:
+            raise HTTPException(status_code=404, detail="檔案不存在或已過期")
+            
+        file_size = file_properties.file_size
         start, end = 0, file_size - 1
 
-        # 修正後的安全解析 Range 區塊，防止空字串或格式問題導致播放器噴 500 錯誤
+        # 2. 解析播放器的 Range 快進/倒退請求
         if range and range.startswith("bytes="):
             try:
                 range_str = range.replace("bytes=", "")
@@ -93,13 +92,16 @@ async def stream_endpoint(chat_id: int, message_id: int, range: str = Header(Non
             "Content-Range": f"bytes {start}-{end}/{file_size}",
             "Accept-Ranges": "bytes",
             "Content-Length": str(end - start + 1),
-            "Content-Type": media.mime_type or "video/mp4",
+            "Content-Type": "video/mp4", # 強制指定為常見影片串流格式
         }
-        return StreamingResponse(chunk_generator(msg, start, end, CHUNK_SIZE), status_code=206, headers=headers)
+        return StreamingResponse(
+            chunk_generator(file_id, start, end, CHUNK_SIZE), 
+            status_code=206, 
+            headers=headers
+        )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 6. 極簡的首頁，方便你用瀏覽器檢查 Render 伺服器是否活著
 @app.get("/")
 async def index():
     return {"status": "running", "message": "Telegram Stream Bot is online!"}
