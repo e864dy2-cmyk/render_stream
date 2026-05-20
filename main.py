@@ -11,20 +11,26 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOMAIN = os.environ.get("DOMAIN", "http://localhost:8000")
 
-# 1. 使用現代 FastAPI 的 lifespan 機制，並將 Bot 啟動放入背景，絕不阻塞伺服器
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # 建立一個背景任務來啟動機器人
+    # 背景啟動機器人，避免卡死 FastAPI
     bot_task = asyncio.create_task(bot.start())
-    print("🚀 FastAPI 伺服器已啟動，正在背景連線至 Telegram MTProto...")
+    print("🚀 FastAPI 已啟動，機器人正於記憶體中建立 MTProto 連線...")
     yield
-    # 關閉時安全停止
     await bot.stop()
     bot_task.cancel()
 
-# 初始化 FastAPI 並帶入壽命週期管理
 app = FastAPI(lifespan=lifespan)
-bot = Client("stream_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
+
+# 💡 關鍵修復：加上 in_memory=True！
+# 強迫 Hydrogram 在記憶體中建立 Session，不再去讀寫 Render 的唯讀硬碟，徹底解決背景崩潰問題
+bot = Client(
+    "stream_session", 
+    api_id=API_ID, 
+    api_hash=API_HASH, 
+    bot_token=BOT_TOKEN,
+    in_memory=True
+)
 
 @bot.on_message(filters.video | filters.document)
 async def handle_media(client: Client, message: Message):
@@ -77,7 +83,6 @@ async def stream_endpoint(chat_id: int, message_id: int, range: str = Header(Non
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-# 加上一個極簡的根目錄首頁，方便你用瀏覽器檢查伺服器是否活著
 @app.get("/")
 async def index():
     return {"status": "running", "message": "Telegram Stream Bot is online!"}
