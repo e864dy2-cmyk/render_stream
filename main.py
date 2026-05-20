@@ -1,4 +1,6 @@
 import os
+import asyncio
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from hydrogram import Client, filters
@@ -9,16 +11,20 @@ API_HASH = os.environ.get("API_HASH", "")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
 DOMAIN = os.environ.get("DOMAIN", "http://localhost:8000")
 
-app = FastAPI()
-bot = Client("stream_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
-
-@app.on_event("startup")
-async def startup():
-    await bot.start()
-
-@app.on_event("shutdown")
-async def shutdown():
+# 1. 使用現代 FastAPI 的 lifespan 機制，並將 Bot 啟動放入背景，絕不阻塞伺服器
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 建立一個背景任務來啟動機器人
+    bot_task = asyncio.create_task(bot.start())
+    print("🚀 FastAPI 伺服器已啟動，正在背景連線至 Telegram MTProto...")
+    yield
+    # 關閉時安全停止
     await bot.stop()
+    bot_task.cancel()
+
+# 初始化 FastAPI 並帶入壽命週期管理
+app = FastAPI(lifespan=lifespan)
+bot = Client("stream_session", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 
 @bot.on_message(filters.video | filters.document)
 async def handle_media(client: Client, message: Message):
@@ -49,9 +55,15 @@ async def stream_endpoint(chat_id: int, message_id: int, range: str = Header(Non
         start, end = 0, file_size - 1
 
         if range and range.startswith("bytes="):
-            parts = range.replace("bytes=", "").split("-")
-            start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else end
+            try:
+                range_str = range.replace("bytes=", "")
+                parts = range_str.split("-")
+                if parts[0]:
+                    start = int(parts[0])
+                if len(parts) > 1 and parts[1]:
+                    end = int(parts[1])
+            except Exception:
+                pass
 
         CHUNK_SIZE = 1024 * 1024 
         
@@ -64,3 +76,8 @@ async def stream_endpoint(chat_id: int, message_id: int, range: str = Header(Non
         return StreamingResponse(chunk_generator(msg, start, end, CHUNK_SIZE), status_code=206, headers=headers)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# 加上一個極簡的根目錄首頁，方便你用瀏覽器檢查伺服器是否活著
+@app.get("/")
+async def index():
+    return {"status": "running", "message": "Telegram Stream Bot is online!"}
